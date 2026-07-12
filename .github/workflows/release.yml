@@ -1,0 +1,477 @@
+name: Build and Release WeFlow
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "weflow-x commit SHA, tag, or branch (a full commit SHA is recommended)"
+        required: true
+        default: "dev"
+        type: string
+      version:
+        description: "Release version, for example 5.0.1 or v5.0.1"
+        required: true
+        type: string
+      prerelease:
+        description: "Publish as a prerelease"
+        required: true
+        default: false
+        type: boolean
+      target:
+        description: "Platform(s) to build"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - macos-arm64
+          - windows-x64
+          - windows-arm64
+          - linux-x64
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weflow-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: hicccc77/weflow-x
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+
+jobs:
+  prepare-release:
+    name: Validate source and prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+
+    steps:
+      - name: Validate private source access
+        env:
+          GH_TOKEN: ${{ secrets.WEFLOW_SOURCE_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Repository secret WEFLOW_SOURCE_TOKEN is not configured."
+            exit 1
+          fi
+          gh api "repos/$SOURCE_REPOSITORY/commits/$SOURCE_REF" --silent
+
+      - name: Normalize release metadata
+        id: metadata
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_VERSION#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version must look like 5.0.1 or v5.0.1."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; build assets will be replaced."
+            exit 0
+          fi
+
+          args=(
+            "$TAG"
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "$VERSION"
+            --notes "WeFlow $TAG"
+          )
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"
+
+  release-mac-arm64:
+    name: macOS ARM64
+    runs-on: macos-14
+    needs: prepare-release
+    if: inputs.target == 'all' || inputs.target == 'macos-arm64'
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Check out private WeFlow source
+        uses: actions/checkout@v5
+        with:
+          repository: hicccc77/weflow-x
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.WEFLOW_SOURCE_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Ensure macOS helpers are executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            resources/key/macos/universal/xkey_helper \
+            resources/key/macos/universal/image_scan_helper \
+            resources/key/macos/universal/xkey_helper_macos \
+            resources/key/macos/universal/libwx_key.dylib
+          do
+            if [ -f "$file" ]; then
+              chmod +x "$file"
+            fi
+          done
+
+      - name: Sync package version
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - name: Build frontend and type check
+        shell: bash
+        run: |
+          npx tsc
+          npx vite build
+
+      - name: Package macOS ARM64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        shell: bash
+        run: |
+          set -euo pipefail
+          common=(
+            --publish never
+            --config.npmRebuild=false
+            --config.publish.provider=github
+            --config.publish.owner=hicccc77
+            --config.publish.repo=weflow-releases
+          )
+          if ! npx electron-builder --mac dmg zip --arm64 "${common[@]}"; then
+            echo "::warning::DMG packaging failed; retrying with ZIP only."
+            npx electron-builder --mac zip --arm64 "${common[@]}"
+          fi
+
+      - name: Upload macOS release files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/release-utils.sh
+          upload_generated_release_files "$GITHUB_REPOSITORY" "$TAG"
+          upload_generated_update_ymls "$GITHUB_REPOSITORY" "$TAG" "4.1.7" latest-mac.yml latest-arm64-mac.yml
+
+  release-linux-x64:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    if: inputs.target == 'all' || inputs.target == 'linux-x64'
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Check out private WeFlow source
+        uses: actions/checkout@v5
+        with:
+          repository: hicccc77/weflow-x
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.WEFLOW_SOURCE_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Ensure Linux helper is executable
+        shell: bash
+        run: |
+          if [ -f resources/key/linux/x64/xkey_helper ]; then
+            chmod +x resources/key/linux/x64/xkey_helper
+          fi
+
+      - name: Sync package version
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - name: Build frontend and type check
+        shell: bash
+        run: |
+          npx tsc
+          npx vite build
+
+      - name: Package Linux x64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          npx electron-builder \
+            --linux \
+            --x64 \
+            --publish never \
+            --config.publish.provider=github \
+            --config.publish.owner=hicccc77 \
+            --config.publish.repo=weflow-releases
+
+      - name: Upload Linux release files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/release-utils.sh
+          upload_generated_release_files "$GITHUB_REPOSITORY" "$TAG"
+          upload_generated_update_ymls "$GITHUB_REPOSITORY" "$TAG" "4.1.7" latest-linux.yml
+
+  release-windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    needs: prepare-release
+    if: inputs.target == 'all' || inputs.target == 'windows-x64'
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Check out private WeFlow source
+        uses: actions/checkout@v5
+        with:
+          repository: hicccc77/weflow-x
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.WEFLOW_SOURCE_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install dependencies
+        shell: bash
+        run: npm install
+
+      - name: Sync package version
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - name: Build frontend and type check
+        shell: bash
+        run: |
+          npx tsc
+          npx vite build
+
+      - name: Package Windows x64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          npx electron-builder \
+            --win nsis \
+            --x64 \
+            --publish never \
+            '--config.artifactName=${productName}-${version}-x64-Setup.${ext}' \
+            --config.publish.provider=github \
+            --config.publish.owner=hicccc77 \
+            --config.publish.repo=weflow-releases
+
+      - name: Upload Windows x64 release files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/release-utils.sh
+          upload_generated_release_files "$GITHUB_REPOSITORY" "$TAG"
+          upload_generated_update_ymls "$GITHUB_REPOSITORY" "$TAG" "4.1.7" latest.yml
+
+  release-windows-arm64:
+    name: Windows ARM64
+    runs-on: windows-latest
+    needs: prepare-release
+    if: inputs.target == 'all' || inputs.target == 'windows-arm64'
+    defaults:
+      run:
+        working-directory: source
+
+    steps:
+      - name: Check out private WeFlow source
+        uses: actions/checkout@v5
+        with:
+          repository: hicccc77/weflow-x
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.WEFLOW_SOURCE_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install dependencies
+        shell: bash
+        run: npm install
+
+      - name: Sync package version
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - name: Build frontend and type check
+        shell: bash
+        run: |
+          npx tsc
+          npx vite build
+
+      - name: Package Windows ARM64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          npx electron-builder \
+            --win nsis \
+            --arm64 \
+            --publish never \
+            '--config.publish.channel=latest-arm64' \
+            '--config.artifactName=${productName}-${version}-arm64-Setup.${ext}' \
+            --config.publish.provider=github \
+            --config.publish.owner=hicccc77 \
+            --config.publish.repo=weflow-releases
+
+      - name: Upload Windows ARM64 release files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/release-utils.sh
+          upload_generated_release_files "$GITHUB_REPOSITORY" "$TAG"
+          upload_generated_update_ymls "$GITHUB_REPOSITORY" "$TAG" "4.1.7" latest-arm64.yml
+
+  update-release-notes:
+    name: Update release notes
+    runs-on: ubuntu-latest
+    needs:
+      - prepare-release
+      - release-mac-arm64
+      - release-linux-x64
+      - release-windows-x64
+      - release-windows-arm64
+    if: |
+      always() &&
+      needs.prepare-release.result == 'success' &&
+      (needs.release-mac-arm64.result == 'success' || needs.release-mac-arm64.result == 'skipped') &&
+      (needs.release-linux-x64.result == 'success' || needs.release-linux-x64.result == 'skipped') &&
+      (needs.release-windows-x64.result == 'success' || needs.release-windows-x64.result == 'skipped') &&
+      (needs.release-windows-arm64.result == 'success' || needs.release-windows-arm64.result == 'skipped')
+
+    steps:
+      - name: Generate platform download links
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="$GITHUB_REPOSITORY"
+          RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
+          ASSETS_JSON="$(gh release view "$TAG" --repo "$REPO" --json assets)"
+
+          pick_url() {
+            local pattern="$1"
+            echo "$ASSETS_JSON" | jq -r --arg p "$pattern" '[.assets[] | select(.name | test($p)) | .url][0] // ""'
+          }
+
+          WINDOWS_URL="$(pick_url "x64.*\\.exe$")"
+          if [ -z "$WINDOWS_URL" ]; then
+            WINDOWS_URL="$(echo "$ASSETS_JSON" | jq -r '[.assets[] | select(.name | test("\\.exe$")) | select(.name | test("arm64") | not) | .url][0] // ""')"
+          fi
+          WINDOWS_ARM64_URL="$(pick_url "arm64.*\\.exe$")"
+          MAC_URL="$(pick_url "\\.dmg$")"
+          if [ -z "$MAC_URL" ]; then
+            MAC_URL="$(pick_url "arm64\\.zip$")"
+          fi
+          LINUX_TAR_URL="$(pick_url "\\.tar\\.gz$")"
+          LINUX_APPIMAGE_URL="$(pick_url "\\.AppImage$")"
+
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          cat > "$NOTES_FILE" <<EOF
+          ## 更新日志
+
+          修复了一些已知问题。
+
+          ## 下载
+
+          - Windows x64（Win10+）：[点击下载](${WINDOWS_URL:-$RELEASE_PAGE})
+          - Windows ARM64：[点击下载](${WINDOWS_ARM64_URL:-$RELEASE_PAGE})
+          - macOS（M 系列芯片）：[点击下载](${MAC_URL:-$RELEASE_PAGE})
+          - Linux (.tar.gz)：[点击下载](${LINUX_TAR_URL:-$RELEASE_PAGE})
+          - Linux (.AppImage)：[点击下载](${LINUX_APPIMAGE_URL:-$RELEASE_PAGE})
+
+          ## macOS 安装提示
+
+          如果系统提示应用已损坏，可在终端执行：
+
+          \`xattr -dr com.apple.quarantine "/Applications/WeFlow.app"\`
+
+          > 如果某个平台链接暂未生成，请进入[完整发布页]($RELEASE_PAGE)查看全部资源。
+          EOF
+
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$NOTES_FILE"
