@@ -222,12 +222,19 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Ensure Linux helper is executable
+      - name: Ensure Linux helpers are executable
         shell: bash
         run: |
-          if [ -f resources/key/linux/x64/xkey_helper ]; then
-            chmod +x resources/key/linux/x64/xkey_helper
-          fi
+          set -euo pipefail
+          for file in \
+            resources/key/linux/x64/xkey_helper_linux \
+            resources/welive/linux/x64/welive
+          do
+            if [ -f "$file" ]; then
+              chmod +x "$file"
+              ls -l "$file"
+            fi
+          done
 
       - name: Sync package version
         env:
